@@ -1,10 +1,12 @@
 /*
- * Despertador Arduino com Buzzer Ativo (5V) e Relé Oscilante
+ * Despertador Arduino com Buzzer Ativo (5V), Relé Oscilante e Soneca (Snooze)
  * 
  * Este código considera que:
  * - O buzzer é do tipo ativo com conexão ao 5V
  * - O pino digital apenas controla o acionamento do buzzer
  * - O relé oscila (liga/desliga) após o horário programado até que o sistema seja reiniciado
+ * - Função de soneca (snooze) permite adiar o alarme por 5 minutos com um clique
+ * - Dois cliques no botão desativa completamente o alarme
  * 
  * Conexões:
  * - Buzzer: Positivo ao 5V, Negativo ao pino 9 via transistor ou ao GND
@@ -27,12 +29,20 @@ int minutoAtual = 0;
 int segundoAtual = 0;
 int horaAlarme = 0;
 int minutoAlarme = 0;
+int horaSnooze = 0;         // Hora para a função soneca
+int minutoSnooze = 0;       // Minuto para a função soneca
 
 // Estados do sistema
 boolean alarmeConfigurado = false;
 boolean alarmeAtivado = false;
 boolean alarmeOscilando = false;
 boolean aguardandoComando = false;
+boolean modoSnooze = false; // Flag para indicar se está em modo soneca
+
+// Controle de cliques do botão
+unsigned long ultimoClique = 0;
+int contadorCliques = 0;
+const unsigned long TEMPO_DUPLO_CLIQUE = 500; // 500ms para detectar duplo clique
 
 // Configuração para oscilação do relé
 const unsigned long TEMPO_OSCILACAO = 500; // 500ms (meio segundo) para cada ciclo liga/desliga
@@ -54,8 +64,8 @@ void setup() {
   // Aguarda conexão serial (útil quando conectado via USB)
   delay(2000);
   
-  Serial.println("Sistema de Despertador Arduino");
-  Serial.println("---------------------------------");
+  Serial.println("Sistema de Despertador Arduino com Soneca");
+  Serial.println("-------------------------------------------");
   
   // Configura o horário inicial
   solicitarHorarioAtual();
@@ -68,6 +78,9 @@ void setup() {
   
   Serial.println("\nSistema iniciado! O relógio está funcionando.");
   Serial.println("Pressione o botão para configurar o alarme.");
+  Serial.println("Quando o alarme tocar:");
+  Serial.println("- Um clique: ativa soneca (alarme em 5 minutos)");
+  Serial.println("- Dois cliques: desativa o alarme completamente");
 }
 
 void loop() {
@@ -77,20 +90,8 @@ void loop() {
   // Verifica se é hora de disparar o alarme
   verificarAlarme();
   
-  // Verifica o botão para desativar o alarme ou configurar um novo
-  if (botaoPressionado()) {
-    if (alarmeAtivado || alarmeOscilando) {
-      // Desativa o alarme se estiver ativo ou oscilando
-      digitalWrite(RELE_PIN, LOW);
-      alarmeAtivado = false;
-      alarmeOscilando = false;
-      bipCurto();
-      Serial.println("Alarme desativado.");
-    } else {
-      // Configura um novo alarme
-      solicitarHorarioAlarme();
-    }
-  }
+  // Verifica o botão para interagir com o alarme
+  verificarBotao();
   
   // Verifica se há comandos disponíveis no Serial
   if (Serial.available() > 0) {
@@ -110,11 +111,8 @@ void loop() {
     } 
     // Comando 'r': reiniciar/desativar alarme
     else if (comando == 'r' || comando == 'R') {
-      if (alarmeAtivado || alarmeOscilando) {
-        digitalWrite(RELE_PIN, LOW);
-        alarmeAtivado = false;
-        alarmeOscilando = false;
-        Serial.println("Alarme desativado.");
+      if (alarmeAtivado || alarmeOscilando || modoSnooze) {
+        desativarAlarmeCompletamente();
       } else {
         Serial.println("Não há alarme ativo para desativar.");
       }
@@ -168,6 +166,142 @@ void loop() {
   digitalWrite(BUZZER_PIN, HIGH);
 }
 
+// Nova função para verificar o botão e gerenciar cliques
+void verificarBotao() {
+  if (digitalRead(BOTAO_PIN) == LOW) { // Botão pressionado (lógica invertida com pull-up)
+    delay(50); // Debounce
+    
+    if (digitalRead(BOTAO_PIN) == LOW) {
+      // Aguarda soltar o botão
+      while (digitalRead(BOTAO_PIN) == LOW) {
+        delay(10);
+      }
+      
+      // Registra o clique
+      unsigned long tempoAtual = millis();
+      
+      // Verifica se é um segundo clique dentro do intervalo de duplo clique
+      if (tempoAtual - ultimoClique < TEMPO_DUPLO_CLIQUE) {
+        contadorCliques = 2; // Registra como duplo clique
+        
+        // Processa o duplo clique imediatamente
+        if (alarmeAtivado || alarmeOscilando || modoSnooze) {
+          desativarAlarmeCompletamente();
+        } else {
+          // Se não há alarme tocando, configura um novo
+          solicitarHorarioAlarme();
+        }
+      } else {
+        // Primeiro clique
+        contadorCliques = 1;
+        ultimoClique = tempoAtual;
+        
+        // Aguarda brevemente para ver se haverá um segundo clique
+        delay(10);
+        
+        // Processamento do clique único será feito após o tempo de espera por duplo clique
+        // Isso é gerenciado em verificarTempoClique()
+      }
+    }
+  }
+  
+  // Verifica se passou o tempo de espera para processar clique único
+  verificarTempoClique();
+}
+
+// Função para verificar o tempo decorrido desde o último clique
+void verificarTempoClique() {
+  unsigned long tempoAtual = millis();
+  
+  // Se temos um clique registrado e passou o tempo de espera para duplo clique
+  if (contadorCliques == 1 && (tempoAtual - ultimoClique > TEMPO_DUPLO_CLIQUE)) {
+    // Processa o clique único
+    if (alarmeAtivado || alarmeOscilando) {
+      // Ativa a função soneca (snooze)
+      ativarSnooze();
+    } else if (!modoSnooze) {
+      // Se não está em modo soneca e não há alarme tocando, configura um novo
+      solicitarHorarioAlarme();
+    }
+    
+    // Reseta o contador de cliques
+    contadorCliques = 0;
+  }
+}
+
+// Função para ativar a soneca (snooze)
+void ativarSnooze() {
+  // Desliga temporariamente o alarme e o relé
+  digitalWrite(RELE_PIN, LOW);
+  alarmeOscilando = false;
+  alarmeAtivado = false;
+  
+  // Calcula o novo horário de alarme (5 minutos depois)
+  minutoSnooze = minutoAtual + 5;
+  horaSnooze = horaAtual;
+  
+  // Ajusta o tempo se passar dos 60 minutos
+  if (minutoSnooze >= 60) {
+    minutoSnooze -= 60;
+    horaSnooze++;
+    
+    // Ajusta se passar das 24 horas
+    if (horaSnooze >= 24) {
+      horaSnooze = 0;
+    }
+  }
+  
+  // Ativa o modo soneca
+  modoSnooze = true;
+  
+  // Notifica o usuário
+  Serial.println("\n*** SONECA ATIVADA! ***");
+  Serial.print("Alarme soará novamente às ");
+  if (horaSnooze < 10) Serial.print("0");
+  Serial.print(horaSnooze);
+  Serial.print(":");
+  if (minutoSnooze < 10) Serial.print("0");
+  Serial.println(minutoSnooze);
+  
+  // Bips confirmando a soneca
+  bipCurto();
+  delay(100);
+  bipCurto();
+}
+
+// Função para desativar completamente o alarme
+void desativarAlarmeCompletamente() {
+  digitalWrite(RELE_PIN, LOW);
+  alarmeAtivado = false;
+  alarmeOscilando = false;
+  modoSnooze = false;
+  
+  Serial.println("\n*** ALARME DESATIVADO COMPLETAMENTE! ***");
+  bipCurto();
+  delay(100);
+  bipCurto();
+  delay(100);
+  bipCurto();
+}
+
+// Função para verificar se é hora de disparar o alarme
+void verificarAlarme() {
+  // Verifica o alarme principal
+  if (alarmeConfigurado && !alarmeAtivado && !alarmeOscilando && !modoSnooze) {
+    if (horaAtual == horaAlarme && minutoAtual == minutoAlarme && segundoAtual == 0) {
+      dispararAlarme();
+    }
+  }
+  
+  // Verifica o alarme de soneca
+  if (modoSnooze && !alarmeAtivado && !alarmeOscilando) {
+    if (horaAtual == horaSnooze && minutoAtual == minutoSnooze && segundoAtual == 0) {
+      dispararAlarme();
+      modoSnooze = false; // Desativa o modo soneca após disparar
+    }
+  }
+}
+
 // Função para verificar comandos do Serial periodicamente
 void verificarComandosSerial() {
   if (!Serial.available() && !aguardandoComando) {
@@ -209,6 +343,13 @@ void exibirStatus() {
     // Verifica se o alarme está ativo
     if (alarmeAtivado || alarmeOscilando) {
       Serial.println("Status: ALARME ATIVADO!");
+    } else if (modoSnooze) {
+      Serial.print("Status: SONECA ATIVADA! Próximo alarme às ");
+      if (horaSnooze < 10) Serial.print("0");
+      Serial.print(horaSnooze);
+      Serial.print(":");
+      if (minutoSnooze < 10) Serial.print("0");
+      Serial.println(minutoSnooze);
     } else {
       Serial.println("Status: Aguardando horário programado");
     }
@@ -265,15 +406,6 @@ void atualizarRelogio() {
   }
 }
 
-// Função para verificar se é hora de disparar o alarme
-void verificarAlarme() {
-  if (alarmeConfigurado && !alarmeAtivado && !alarmeOscilando) {
-    if (horaAtual == horaAlarme && minutoAtual == minutoAlarme && segundoAtual == 0) {
-      dispararAlarme();
-    }
-  }
-}
-
 // Função para disparar o alarme
 void dispararAlarme() {
   // Inicia a oscilação do relé
@@ -288,7 +420,8 @@ void dispararAlarme() {
   bipAlarme();
   
   Serial.println("\n*** ALARME ATIVADO! ***");
-  Serial.println("Pressione o botão para desativar o alarme.");
+  Serial.println("- Um clique: soneca (adia 5 minutos)");
+  Serial.println("- Dois cliques: desativa o alarme completamente");
 }
 
 // Exibe o horário atual formatado
@@ -320,6 +453,19 @@ void exibirHorarioAtual() {
       Serial.print("0");
     }
     Serial.println(minutoAlarme);
+  }
+  
+  if (modoSnooze) {
+    Serial.print("Soneca às: ");
+    if (horaSnooze < 10) {
+      Serial.print("0");
+    }
+    Serial.print(horaSnooze);
+    Serial.print(":");
+    if (minutoSnooze < 10) {
+      Serial.print("0");
+    }
+    Serial.println(minutoSnooze);
   }
 }
 
@@ -478,6 +624,8 @@ void solicitarHorarioAlarme() {
   
   // Ativa o alarme
   alarmeConfigurado = true;
+  modoSnooze = false; // Desativa modo soneca ao configurar novo alarme
+  
   Serial.println("Alarme configurado com sucesso!");
   Serial.print("Alarme programado para: ");
   if (horaAlarme < 10) {
@@ -489,23 +637,6 @@ void solicitarHorarioAlarme() {
     Serial.print("0");
   }
   Serial.println(minutoAlarme);
-}
-
-// Verifica se o botão foi pressionado com debounce
-boolean botaoPressionado() {
-  // Lê o estado do botão (com pull-up, LOW = pressionado)
-  if (digitalRead(BOTAO_PIN) == LOW) {
-    delay(50); // Debounce
-    
-    if (digitalRead(BOTAO_PIN) == LOW) {
-      // Aguarda soltar o botão
-      while (digitalRead(BOTAO_PIN) == LOW) {
-        delay(10);
-      }
-      return true;
-    }
-  }
-  return false;
 }
 
 // Função para emitir um bip curto
